@@ -82,6 +82,11 @@ normal upgrade path.
 
 ## Proposed Model
 
+The RFC contract is intentionally incremental: core Doctor contributions keep
+owning order and legacy repair behavior, while structured health data is added
+at the contribution boundary. The shared registry remains the extension surface
+and the append-only source for non-core checks.
+
 ### Doctor contributions remain the core source of truth
 
 Built-in Doctor checks continue to be declared as Doctor health contributions.
