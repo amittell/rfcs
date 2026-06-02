@@ -16,30 +16,34 @@ scheduled jobs and gateway heartbeats from a single in-process scheduler.
 Operators with workflows that need durability, retries, approvals, multi-step
 chains, or full run history reach for external schedulers (notably
 `openclaw-scheduler`, a SQLite-backed sibling service), but those tools have to
-talk to the gateway only through the public HTTP surface and cannot register
-scheduled work that the gateway considers first-class. This RFC proposes a
+talk to the gateway through the public HTTP `cron.*` surface. Plugins can
+already schedule Cron-backed session turns, but no external scheduler can
+register itself as the canonical owner of scheduled work. This RFC proposes a
 narrow plugin-SDK seam that lets an external scheduler plugin own scheduled-job
-dispatch while the gateway keeps owning heartbeats and run-state ingestion.
+dispatch while the gateway keeps owning heartbeats and the core run-state
+surfaces.
 
 ## Motivation
 
 The built-in cron is correct for the common case: one or two scheduled agent
 prompts, low audit needs, every operator wants it to "just work." It is
-intentionally limited:
+intentionally scoped to in-process Cron semantics:
 
-- Runs are not persisted in a queryable form; failures disappear into the
-  gateway log.
+- Runs have gateway-owned run-log/status surfaces, but that history is tied to
+  built-in Cron and cannot represent an external scheduler's durable run graph.
 - A job that needs `shell -> agent -> approval -> shell` cannot be expressed.
-- A failing job has no retry contract beyond the next cron tick.
+- Retry and concurrency policy is tied to the single Cron job lifecycle, not to
+  durable multi-step workflow state owned by another scheduler.
 - The cron is in-process with the gateway, so a draining gateway pauses
   scheduling for the duration of the drain.
 
 Operators who need any of those affordances today install `openclaw-scheduler`
 as a sibling service and disable the built-in cron, but that splits the
 scheduling surface across two systems with no shared run-state model. The
-gateway has no way to surface scheduler-owned runs in `gateway status`,
-hooks, or transcripts, and the scheduler cannot mark itself as the canonical
-owner of scheduled work.
+gateway has Cron-backed plugin scheduling helpers and a `cron_changed` hook for
+gateway-owned jobs, but an external scheduler still cannot mark itself as the
+canonical owner of scheduled work or project its runs through the same status,
+hook, run-log, and transcript surfaces.
 
 ## Goals
 
@@ -83,8 +87,10 @@ contracts.
 
 When a `scheduler` plugin is registered and `owns: "scheduled-jobs"`, the
 gateway disables its in-process cron at startup and routes all
-`gateway scheduledJobs.*` calls to the plugin. If no scheduler plugin is
-registered, the built-in cron stays on.
+`cron.*` scheduled-job calls to the plugin. If no scheduler plugin is
+registered, the built-in cron stays on. The manifest shape above is additive:
+implementation should extend the current plugin-kind and contract registry
+rather than reinterpret any existing capability contract.
 
 Fallback is also a startup decision in v1. If a scheduler plugin owns
 scheduled jobs, uninstalling or disabling that plugin, or otherwise changing
@@ -105,14 +111,17 @@ export interface SchedulerHostRuntime {
 }
 ```
 
-The gateway's existing scheduled-job config (`scheduledJobs` in
-`gateway.json`) is forwarded to `registerScheduledJob` at startup. The plugin
-owns the storage; the gateway forgets the spec after the call returns.
+When the scheduler plugin owns scheduled jobs, new or updated `cron.*` job
+specs are forwarded to `registerScheduledJob`. The plugin owns scheduler
+storage and runtime after registration, and the gateway treats
+`listScheduledJobs` as the canonical catalog for list/status surfaces. Existing
+built-in Cron stores are not migrated automatically in v1; they remain available
+for the built-in fallback path or a follow-up `openclaw doctor` migration.
 
 ### Run-state contract (`scheduler-run-state.ts`)
 
-The plugin pushes run lifecycle events into a generic ingestion channel the
-gateway already owns:
+The plugin pushes run lifecycle events into a scheduler-owned ingestion adapter
+that feeds the gateway's existing cron event fan-out:
 
 ```typescript
 runState.onStart({ jobId, runId, startedAt, trigger });
@@ -120,15 +129,17 @@ runState.onComplete({ jobId, runId, endedAt, exitCode, deliveredMessageIds });
 runState.onError({ jobId, runId, endedAt, error });
 ```
 
-The gateway uses these to (1) surface runs in `gateway status`, (2) fire the
-existing `scheduled_run.*` hooks, and (3) mirror agent-job transcripts. The
-plugin does not have to integrate with each consumer individually.
+The gateway uses these to (1) surface runs in `gateway status` and `cron.runs`,
+(2) fire the existing `cron_changed` hook with the same public event shape used
+for built-in cron, and (3) mirror or link agent-job transcripts when the plugin
+run produces gateway-visible agent turns. The plugin does not have to integrate
+with each consumer individually.
 
 A diagram of the discovery flow will be added under `rfcs/0006/` in a follow-up
 revision once the seam shape is settled. In short: when the scheduler plugin
 manifest declares `owns: "scheduled-jobs"`, the gateway swaps its built-in cron
 registration for a forwarder to the plugin runtime, and ingests run lifecycle
-through the generic `runState` channel. Heartbeats stay in core.
+through the scheduler run-state adapter. Heartbeats stay in core.
 
 ## Rationale
 
@@ -163,10 +174,11 @@ itself healthy.
 
 ### Alternatives considered
 
-- **Hook-only integration.** External schedulers could simply call the
-  existing `scheduled_run.*` hooks. This works for run state, but does not
-  give the gateway any way to know who owns the schedule, so config-driven
-  jobs in `gateway.json` cannot be routed to the plugin.
+- **Hook-only integration.** External schedulers could try to project run
+  updates through the existing `cron_changed` hook shape. This works for
+  observers, but does not give the gateway any way to know who owns the
+  schedule, so existing cron jobs and `cron.*` calls cannot be routed to the
+  plugin.
 - **Replace built-in cron entirely with this seam.** Tempting, but breaks
   every operator who has not installed a scheduler plugin and creates a
   hard dependency on an external package for gateway readiness.
@@ -177,12 +189,12 @@ itself healthy.
 
 The consumer side already works. `openclaw-scheduler` has been deployed on
 two gateways for several weeks, talking to OpenClaw only through the public
-HTTP surface. Listing on ClawHub as `durable-scheduler` is live. What is
-missing is the seam that would let the same external runtime be registered
-as the canonical scheduler so its runs surface in `gateway status`, hooks,
-and transcripts. If the seam shape proposed here is accepted, I am willing
-to carry the reference implementation as a follow-up PR against
-`openclaw/openclaw`.
+HTTP `cron.*` surface. Listing on ClawHub as `durable-scheduler` is live. Core
+already has adjacent pieces for Cron-backed plugin scheduled turns, the
+`cron_changed` hook, and cron run-log/status surfaces; the missing part is
+startup-time scheduler ownership plus an adapter from plugin-owned runs into
+those surfaces. If the seam shape proposed here is accepted, I am willing to
+carry the reference implementation as a follow-up PR against `openclaw/openclaw`.
 
 ## Unresolved questions
 
@@ -196,8 +208,8 @@ to carry the reference implementation as a follow-up PR against
   schedulers via direct HTTP today? Probably an `openclaw doctor` finding
   that suggests installing the scheduler plugin, but the details belong in
   a follow-up RFC, not this one.
-- Should the seam also expose a read-only `listScheduledJobs` over the
-  plugin SDK so docs/tools can render the canonical job catalog without
-  reading from each scheduler's storage? The case for it is operator
-  observability; the case against is that pushing this through the runtime
-  channel keeps the seam smaller.
+- The runtime contract includes `listScheduledJobs`. Should docs/tools consume
+  that runtime method directly, or should they stay behind the existing
+  `cron.list`/`cron.status` gateway surface so scheduler storage remains fully
+  private? The case for direct use is operator observability; the case against
+  is keeping consumer APIs independent of the scheduler runtime.
