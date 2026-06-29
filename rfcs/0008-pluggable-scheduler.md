@@ -3,7 +3,7 @@ title: Pluggable Scheduler Seam in Gateway
 authors:
   - amittell
 created: 2026-05-31
-last_updated: 2026-06-12
+last_updated: 2026-06-29
 rfc_pr: https://github.com/openclaw/rfcs/pull/5
 status: draft
 issue:
@@ -123,6 +123,21 @@ storage and runtime after registration, and the gateway treats
 built-in Cron stores are not migrated automatically in v1; they remain available
 for the built-in fallback path or a follow-up `openclaw doctor` migration.
 
+`cancelScheduledJob` is required in v1. A scheduler that can accept live
+registration must also be able to cancel that live handle; otherwise the gateway
+cannot make `cron.delete`, `cron.disable`, plugin uninstall, or rollback
+semantics predictable. If a scheduler process is unavailable, the gateway
+reports the cancel failure instead of silently promising that a next-startup
+unregister will eventually happen.
+
+Operator-facing list and status consumers should stay behind the gateway's
+existing `cron.list`, `cron.status`, and `cron.runs` surfaces. The gateway may
+call `listScheduledJobs` internally to back those surfaces when a scheduler
+plugin owns scheduled jobs, but docs, tools, and channel integrations should not
+depend on the scheduler runtime method directly. This keeps scheduler storage
+private and leaves the public observability API stable if the runtime contract
+changes.
+
 ### Run-state contract (`scheduler-run-state.ts`)
 
 The plugin pushes run lifecycle events into a scheduler-owned ingestion adapter
@@ -139,6 +154,24 @@ The gateway uses these to (1) surface runs in `gateway status` and `cron.runs`,
 for built-in cron, and (3) mirror or link agent-job transcripts when the plugin
 run produces gateway-visible agent turns. The plugin does not have to integrate
 with each consumer individually.
+
+Run-state events cross a trust boundary from plugin-owned scheduler storage into
+gateway-owned status, hook, and transcript-adjacent surfaces. The v1 seam must
+therefore treat scheduler events as untrusted input:
+
+- The gateway validates every event shape and rejects unknown fields that would
+  affect routing, transcript linkage, delivery state, or authorization.
+- Every accepted event is tagged with the owning plugin id and scheduler job id
+  so status and audit views can distinguish plugin-projected runs from built-in
+  Cron runs.
+- Events are deduplicated by `(pluginId, jobId, runId, eventType)` and accepted
+  only in a monotonic lifecycle order: `start -> complete | error`.
+- Plugin events may link to gateway-visible agent turns that the gateway already
+  created, but they do not get to mint transcript records or delivery receipts
+  for sessions the gateway cannot verify.
+- If the scheduler plugin is unavailable or emits invalid events, the gateway
+  marks the scheduler projection degraded and leaves built-in Cron fallback as a
+  restart-time ownership decision rather than attempting a hot failover.
 
 A diagram of the discovery flow will be added under `rfcs/0008/` in a follow-up
 revision once the seam shape is settled. In short: when the scheduler plugin
@@ -205,11 +238,9 @@ carry the reference implementation as a follow-up PR against `openclaw/openclaw`
 
 ## Unresolved questions
 
-- Should `cancelScheduledJob` be required, or optional with a fallback to
-  unregistering the spec on next startup? Optional is simpler but
-  inconsistent with `registerScheduledJob` returning a live handle.
-- The runtime contract includes `listScheduledJobs`. Should docs/tools consume
-  that runtime method directly, or should they stay behind the existing
-  `cron.list`/`cron.status` gateway surface so scheduler storage remains fully
-  private? The case for direct use is operator observability; the case against
-  is keeping consumer APIs independent of the scheduler runtime.
+- Should acceptance require a separate implementation issue before merge, or is
+  maintainer approval on this RFC enough to create that issue as part of the
+  first implementation PR?
+- Should the first implementation require an explicit config opt-in in addition
+  to the scheduler plugin manifest, or is installing an enabled
+  `owns: "scheduled-jobs"` plugin sufficient operator intent?
