@@ -173,7 +173,7 @@ therefore treat scheduler events as untrusted input:
   marks the scheduler projection degraded and leaves built-in Cron fallback as a
   restart-time ownership decision rather than attempting a hot failover.
 
-A diagram of the discovery flow will be added under `rfcs/0008/` in a follow-up
+A diagram of the discovery flow will be added under `rfcs/0010/` in a follow-up
 revision once the seam shape is settled. In short: when the scheduler plugin
 manifest declares `owns: "scheduled-jobs"`, the gateway swaps its built-in cron
 registration for a forwarder to the plugin runtime, and ingests run lifecycle
